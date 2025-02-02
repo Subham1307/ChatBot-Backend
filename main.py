@@ -1,184 +1,138 @@
-import io
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import uuid
-import PyPDF2
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+import os
 from dotenv import load_dotenv
-
-# LangChain imports
+import openai
+import io
+import PyPDF2
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
-from langchain_openai import ChatOpenAI
-from langchain.schema import StrOutputParser
-from langchain.prompts import PromptTemplate
+from typing import List
+from fastapi import Body
 
-# TruLens Evaluation imports
-from trulens_eval import TruChain, Feedback, OpenAI, Tru
-
-# Guardrails for filtering responses
-
-# Load environment variables (make sure you have your .env file with API keys)
-load_dotenv()
-
-# Initialize Guardrails for safety filtering
-
-# Initialize OpenAI API provider for evaluation
-openai_provider = OpenAI()
-tru = Tru()
-
-# Initialize the ChatOpenAI model
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
-
-# Define the prompt template for our RAG chain
-prompt_template = """
-You are an AI assistant that strictly answers questions based on the provided insurance policy document.
-Follow these steps to generate an accurate response:
-
-1. Review the past conversation for context.
-2. Carefully analyze the user's latest question.
-3. Extract only the necessary information from the insurance policy.
-4. Do NOT provide financial, investment, or legal advice.
-
-### Past Conversation:  
-{chat_history}
-
-### Context from PDF:  
-{context}  
-
-### User's Latest Question:  
-{question}  
-
-Answer:
-"""
-
-# Global dictionary to store processed PDFs keyed by a unique identifier (uin)
-pdf_stores = {}
-
-# Initialize FastAPI app
 app = FastAPI()
 
-# Add CORS middleware to allow requests from any origin (adjust for production)
-from fastapi.middleware.cors import CORSMiddleware
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace ["*"] with a list of allowed origins
+    allow_origins=["*"],  # Allows all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
-# ---------------------------
-# Endpoint: /upload-pdf
-# ---------------------------
+# Load environment variables
+
+from openai import OpenAI
+load_dotenv()
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+# Initialize OpenAI embeddings
+embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize FAISS vectorstore
+vectorstore = None
+valid_uins = set()
+
+# Initialize text splitter with overlap
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50,
+    separators=["\n\n", "\n", "(?<=\. )", " ", ""]
+)
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + " "
+    return text
+
 @app.post("/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...)):
-    """
-    Upload a PDF file, extract its text, split it into chunks, 
-    create a vectorstore using embeddings, and return a unique identifier (uin).
-    """
+async def pdf_upload(file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
     
     file_bytes = await file.read()
-    try:
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        pdf_text = "\n".join(
-            page.extract_text() for page in pdf_reader.pages if page.extract_text()
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Error processing PDF file.")
+    text = extract_text_from_pdf(file_bytes)
+    print(text)
     
-    # Split the text into smaller chunks for efficient retrieval
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    documents = text_splitter.create_documents([pdf_text])
+    # Split text with overlap using recursive splitter
+    chunks = text_splitter.split_text(text)
     
-    # Create vector embeddings and build the vectorstore using FAISS
-    embeddings = OpenAIEmbeddings()
-    vectorstore = FAISS.from_documents(documents, embeddings)
-    
-    # Generate a unique identifier for this PDF upload
+    # Generate unique identifier
     uin = str(uuid.uuid4())
-    pdf_stores[uin] = {"vectorstore": vectorstore, "chat_history": []}
-    print(pdf_stores)
     
-    return {"uin": uin}
-
-# ---------------------------
-# Endpoint: /query
-# ---------------------------
-from pydantic import BaseModel
-
-class QueryRequest(BaseModel):
-    uin: str
-    question: str
+    # Create metadata for each chunk
+    metadatas = [{"uin": uin} for _ in chunks]
     
+    # Add to vectorstore
+    global vectorstore
+    if vectorstore is None:
+        vectorstore = FAISS.from_texts(chunks, embeddings, metadatas=metadatas)
+    else:
+        vectorstore.add_texts(chunks, metadatas=metadatas)
+    
+    valid_uins.add(uin)
+    return {"uin": uin, "num_chunks": len(chunks)}
+
 @app.post("/query")
-async def query_pdf(query: QueryRequest):
-    """
-    Query an uploaded PDF using its unique identifier (uin) and a question.
-    The endpoint retrieves the relevant PDF content from the vectorstore, 
-    constructs a prompt (including previous conversation context), and generates an answer.
-    """
+async def query_endpoint(query: str = Body(...),
+                         uins: List[str] = Body(...)):
+    if not uins:
+        raise HTTPException(status_code=400, detail="No UINs provided")
     
-    uin = query.uin
-    question = query.question
-    print("UIN number is ", uin)
-    print("Asked question is ", question)
-    if uin not in pdf_stores:
-        raise HTTPException(status_code=404, detail="PDF not found for the given uin.")
+    # Validate UINs
+    for uin in uins:
+        if uin not in valid_uins:
+            raise HTTPException(status_code=404, detail=f"UIN {uin} not found")
     
-    # Retrieve stored vectorstore and chat history for this PDF
-    store = pdf_stores[uin]
-    vectorstore = store["vectorstore"]
-    chat_history = "\n".join(store["chat_history"])
+    answers_by_uin = {}
     
-    print("till here ok")
-    
-    # Retrieve top 5 relevant document chunks from the vectorstore
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-    docs = retriever.get_relevant_documents(question)
-    context = "\n\n".join(doc.page_content for doc in docs)
-    
-    # Format the prompt using the template, incorporating context, history, and the new question
-    formatted_prompt = prompt_template.format(
-        chat_history=chat_history, context=context, question=question
-    )
-    
-    # Generate the raw response using the LLM
-    raw_response = llm(formatted_prompt)
-    
-    print("raw response ",raw_response)
-    
-    # Apply Guardrails filtering for safety
-    # guard_filter = guard.to_runnable()
-    # safe_response = guard_filter(raw_response)
-    
-    # Parse the filtered response to produce a final string answer
-    output_parser = StrOutputParser()
-    parsed_response = output_parser.parse(raw_response)
-    
-    # Update chat history for future queries
-    store["chat_history"].append(f"User: {question}")
-    store["chat_history"].append(f"Assistant: {parsed_response}")
-    
-    return {"reply": parsed_response}
+    # For each UIN, perform a similarity search and generate an answer
+    for uin in uins:
+        # Retrieve top 10 chunks only for this specific uin
+        docs = vectorstore.similarity_search(
+            query, 
+            k=10,
+            filter=lambda x: x["uin"] == uin
+        )
+        
+        if not docs:
+            answers_by_uin[uin] = "No relevant information found in provided document."
+        else:
+            # Build context for this uin
+            context = "\n\n".join([doc.page_content for doc in docs])
+            prompt = f"""Answer the question based only on the following context for document {uin}:
 
-# ---------------------------
-# Endpoint: /dashboard
-# ---------------------------
-@app.get("/dashboard")
-async def run_dashboard():
-    """
-    Launch the TruLens evaluation dashboard.
-    """
-    tru.run_dashboard()
-    return JSONResponse(content={"detail": "TruLens dashboard launched."})
+{context}
 
-# ---------------------------
-# Run the application
-# ---------------------------
+Question: {query}
+Answer:"""
+            # Call OpenAI's ChatCompletion API
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            answer = response.choices[0].message.content.strip()
+            answers_by_uin[uin] = answer
+    
+    # Merge individual answers into a final composite answer
+    final_answer = "\n\n".join(
+    [f"{answers_by_uin[uin]}" for uin in uins]
+)
+    
+    return {
+        "final_answer": final_answer,
+        "individual_answers": answers_by_uin
+    }
 if __name__ == "__main__":
     import uvicorn
-    # Adjust the module path if your file name is different or if the app is in a subdirectory.
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
