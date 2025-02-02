@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+PyPDF2
+python-dotenv
+langchain
+langchain_openai
+langchain_community
+trulens_eval
+guardrails-ai
+faiss-cpu
+trulens 
+trulens-apps-langchain 
+trulens-providers-openai
