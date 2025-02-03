@@ -1,28 +1,33 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from fastapi.middleware.cors import CORSMiddleware
+import re
 import uuid
 import os
 import io
+from typing import List, Optional
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
 import PyPDF2
 from dotenv import load_dotenv
-from typing import List
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chat_models import ChatOpenAI
 from langchain.prompts import PromptTemplate
-from langchain.schema import StrOutputParser
 
+from utils.uin import extract_uin  # Import UIN extraction function
+
+# Initialize FastAPI app
 app = FastAPI()
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Load environment variables
@@ -54,29 +59,55 @@ text_splitter = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", "(?<=\. )", " ", ""]
 )
 
+# Prompt template for generating answers
 prompt_template = """
-You are an AI assistant that strictly answers questions based on the provided insurance policy document.
-Follow these steps to generate an accurate response:
+You are an AI assistant specializing in extracting, analyzing, and presenting precise insights from insurance policy documents. Your task is to generate an accurate response using only the provided policy content while ensuring clarity, completeness, and structured formatting.
 
-1. Understand the query and examine what it wants.
-2. Analyze the context and get the answer
-3. Extract the company name from the insurance policy document.
-4. Extract only the necessary information from the insurance policy.
-5. Do NOT provide financial, investment, or legal advice.
+### **Guidelines for Response:**
+#### 1. **Accurate Extraction**:
+- Extract only relevant details from the policy document.
+- Ensure responses are **precise, complete, and directly based on the context** provided.
+- **Do NOT provide financial, investment, or legal advice.**
 
-### Context from PDF:  
+#### 2. **Structured & Professional Formatting**:
+- **Company Identification**: If the insurance company's name is mentioned, start the response with its name. Example:  
+  **SBI: [Extracted Information]**
+- **Clear, concise, and well-formatted answers**:
+  - Use bullet points or numbered lists where applicable.
+  - Present information in an **organized and professional** manner.
+
+#### 3. **Comprehensive Numerical Extraction**:
+- **Collect as many numerical details as possible**, including percentages, monetary values, age limits, durations, charges, and benefits.
+- Ensure all numerical details follow a standardized format:
+  - **Monetary values**: Use INR format with commas (e.g., **₹50,000**).
+  - **Percentages**: Express values explicitly (e.g., **"1.8% loyalty additions"**).
+  - **Age and duration**: Use whole numbers (e.g., **"30 years"**).
+- If a charge, benefit, or limit applies over time, **aggregate values** where relevant:
+  - **Example**: "Policy Admin Charge: ₹200/month, totaling ₹2,400 annually."
+  - **Example**: "Maximum of 4 partial withdrawals per year, with a ₹100 charge per withdrawal beyond the free limit."
+
+#### 4. **Handling Missing or Ambiguous Data**:
+- If a required detail is **not explicitly mentioned**, respond with `"Not Specified"`.
+- Avoid making assumptions but provide logical inferences if evident from the context.
+- Clearly indicate when inferred details are used.
+
+#### 5. **Scenario-Based Summaries (if applicable)**:
+- Where relevant, add structured summaries or examples, such as:
+  - **"Premium payment term: 10 years, policy maturity at 20 years."**
+  - **"Sum assured: ₹5,00,000 with a 10% bonus every 5 years."**
+  - **"Partial withdrawal allowed after 5 years, subject to a 5% fee per transaction."**
+- Use a structured breakdown of key financial figures, highlighting limits, charges, and benefits.
+
+---
+
+### **Policy Document Context:**
 {context}  
 
-### User's Latest Question:  
+### **User's Query:**
 {query}  
 
-Answer:
-- First, determine the insurance company name.
-- If the company name is found (e.g., "SBI"), structure the response as:
-  **SBI: [Extracted Information]**
-- Otherwise, provide the extracted answer directly.
+### **Answer:**
 
-Answer:
 """
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -87,17 +118,20 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 @app.post("/upload-pdf")
 async def pdf_upload(file: UploadFile = File(...)):
+    """Uploads a PDF, extracts its text, and stores it in Qdrant with embeddings."""
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
 
     file_bytes = await file.read()
     text = extract_text_from_pdf(file_bytes)
-    
+
+    # Extract UIN from document
+    uin = extract_uin(text)
+    if not uin:
+        raise HTTPException(status_code=400, detail="No valid UIN found in the document.")
+
     # Split text into chunks
     chunks = text_splitter.split_text(text)
-
-    # Generate unique UIN
-    uin = str(uuid.uuid4())
 
     # Convert text chunks to embeddings
     vectors = embeddings.embed_documents(chunks)
@@ -110,10 +144,12 @@ async def pdf_upload(file: UploadFile = File(...)):
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
     valid_uins.add(uin)
+
     return {"uin": uin, "num_chunks": len(chunks)}
 
 @app.post("/query")
 async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
+    """Processes a query by searching relevant PDF content and generating a response."""
     if not uins:
         raise HTTPException(status_code=400, detail="No UINs provided")
 
