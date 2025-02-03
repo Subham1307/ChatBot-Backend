@@ -11,3 +11,5 @@ faiss-cpu
 trulens 
 trulens-apps-langchain 
 trulens-providers-openai
+qdrant-client
+
