@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import uuid
 import os
 from dotenv import load_dotenv
-import openai
 import io
 import PyPDF2
 from langchain.embeddings.openai import OpenAIEmbeddings
@@ -11,8 +10,41 @@ from langchain.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from typing import List
 from fastapi import Body
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.schema import StrOutputParser
+
+
+
 
 app = FastAPI()
+
+prompt_template = """
+You are an AI assistant that strictly answers questions based on the provided insurance policy document.
+Follow these steps to generate an accurate response:
+
+1. Understand the query and examine what it wants.
+2. Analyze the context and get the answer
+3. Extract the company name from the insurance policy document.
+4. Extract only the necessary information from the insurance policy.
+5. Do NOT provide financial, investment, or legal advice.
+
+
+### Context from PDF:  
+{context}  
+
+### User's Latest Question:  
+{query}  
+
+
+Answer:
+- First, determine the insurance company name.
+- If the company name is found (e.g., "SBI"), structure the response as:
+  **SBI: [Extracted Information]**
+- Otherwise, provide the extracted answer directly.
+
+Answer:
+"""
 
 # Add CORS middleware
 app.add_middleware(
@@ -25,11 +57,8 @@ app.add_middleware(
 
 # Load environment variables
 
-from openai import OpenAI
 load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-)
+llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
 
 # Initialize OpenAI embeddings
 embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
@@ -59,7 +88,7 @@ async def pdf_upload(file: UploadFile = File(...)):
     
     file_bytes = await file.read()
     text = extract_text_from_pdf(file_bytes)
-    print(text)
+    print("extracted text is ",text)
     
     # Split text with overlap using recursive splitter
     chunks = text_splitter.split_text(text)
@@ -98,31 +127,23 @@ async def query_endpoint(query: str = Body(...),
         # Retrieve top 10 chunks only for this specific uin
         docs = vectorstore.similarity_search(
             query, 
-            k=10,
+            k=5,
             filter=lambda x: x["uin"] == uin
         )
-        
+        # print("docs found ",docs)
         if not docs:
             answers_by_uin[uin] = "No relevant information found in provided document."
         else:
             # Build context for this uin
             context = "\n\n".join([doc.page_content for doc in docs])
-            prompt = f"""Answer the question based only on the following context for document {uin}:
+            # print("Context - ",context)
+            
+            prompt = PromptTemplate(input_variables=["context", "query"], template=prompt_template)
 
-{context}
 
-Question: {query}
-Answer:"""
-            # Call OpenAI's ChatCompletion API
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that answers questions based on the provided context."},
-                    {"role": "user", "content": prompt}
-                ]
-            )
-            answer = response.choices[0].message.content.strip()
-            answers_by_uin[uin] = answer
+            formatted_prompt = prompt.format(context=context, query=query)
+            answer = llm.invoke(query)
+            answers_by_uin[uin] = answer.content
     
     # Merge individual answers into a final composite answer
     final_answer = "\n\n".join(
