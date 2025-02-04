@@ -50,7 +50,9 @@ qdrant.recreate_collection(
     vectors_config=VectorParams(size=1536, distance=Distance.COSINE)  # OpenAI embedding size
 )
 
+# Global sets/dicts to track UINs and company names
 valid_uins = set()
+uin_to_company = {}  # Mapping of UIN to company name
 
 # Initialize text splitter
 text_splitter = RecursiveCharacterTextSplitter(
@@ -61,76 +63,106 @@ text_splitter = RecursiveCharacterTextSplitter(
 
 # Prompt template for generating answers
 prompt_template = """
-You are an AI assistant specializing in extracting, analyzing, and presenting precise insights from insurance policy documents. Your task is to generate an accurate response using only the provided policy content while ensuring clarity, completeness, and structured formatting.
+You are an insurance policy document analysis expert specializing in extracting, analyzing, and presenting precise insights from insurance policy documents. Your task is to generate an accurate response using only the provided policy content while ensuring clarity, completeness, and structured formatting.
 
-### **Guidelines for Response:**
-#### 1. **Accurate Extraction**:
+### Guidelines for Response:
+#### 1. Accurate Extraction:
 - Extract only relevant details from the policy document.
-- Ensure responses are **precise, complete, and directly based on the context** provided.
-- **Do NOT provide financial, investment, or legal advice.**
+- Ensure responses are precise, complete, and directly based on the context provided.
+- Do NOT provide financial, investment, or legal advice.
 
-#### 2. **Structured & Professional Formatting**:
-- **Company Identification**: If the insurance company's name is mentioned, start the response with its name. Example:  
-  **SBI: [Extracted Information]**
-- **Clear, concise, and well-formatted answers**:
+#### 2. Structured & Professional Formatting:
+  - Clear, concise, and well-formatted answers:
   - Use bullet points or numbered lists where applicable.
-  - Present information in an **organized and professional** manner.
+  - Present information in an organized and professional manner.
 
-#### 3. **Comprehensive Numerical Extraction**:
-- **Collect as many numerical details as possible**, including percentages, monetary values, age limits, durations, charges, and benefits.
-- Ensure all numerical details follow a standardized format:
-  - **Monetary values**: Use INR format with commas (e.g., **₹50,000**).
-  - **Percentages**: Express values explicitly (e.g., **"1.8% loyalty additions"**).
-  - **Age and duration**: Use whole numbers (e.g., **"30 years"**).
-- If a charge, benefit, or limit applies over time, **aggregate values** where relevant:
-  - **Example**: "Policy Admin Charge: ₹200/month, totaling ₹2,400 annually."
-  - **Example**: "Maximum of 4 partial withdrawals per year, with a ₹100 charge per withdrawal beyond the free limit."
-
-#### 4. **Handling Missing or Ambiguous Data**:
-- If a required detail is **not explicitly mentioned**, respond with `"Not Specified"`.
-- Avoid making assumptions but provide logical inferences if evident from the context.
-- Clearly indicate when inferred details are used.
-
-#### 5. **Scenario-Based Summaries (if applicable)**:
-- Where relevant, add structured summaries or examples, such as:
-  - **"Premium payment term: 10 years, policy maturity at 20 years."**
-  - **"Sum assured: ₹5,00,000 with a 10% bonus every 5 years."**
-  - **"Partial withdrawal allowed after 5 years, subject to a 5% fee per transaction."**
 - Use a structured breakdown of key financial figures, highlighting limits, charges, and benefits.
 
 ---
 
-### **Policy Document Context:**
+### Policy Document Context:**
 {context}  
 
-### **User's Query:**
+### User's Query:
 {query}  
 
-### **Answer:**
+### Answer:
 
 """
 
+# Prompt template for extracting company name
+company_prompt_template = """
+You are an expert in extracting company names from insurance policy documents.
+Extract and return only the company name from the following text.
+If no company name is found, return "Not Specified".
+
+Text:
+{page_text}
+"""
+
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from PDF file."""
+    """Extract text from entire PDF file."""
     reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     text = " ".join([page.extract_text() for page in reader.pages if page.extract_text()])
     return text
 
+def extract_text_from_first_two_pages(file_bytes: bytes) -> str:
+    """Extract text from the first two pages of a PDF."""
+    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+    pages_text = []
+    for i in range(min(2, len(reader.pages))):
+        page_text = reader.pages[i].extract_text()
+        if page_text:
+            pages_text.append(page_text)
+    return " ".join(pages_text)
+
 @app.post("/upload-pdf")
 async def pdf_upload(file: UploadFile = File(...)):
-    """Uploads a PDF, extracts its text, and stores it in Qdrant with embeddings."""
+    """Uploads a PDF, extracts its text, and stores it in Qdrant with embeddings.
+    Additionally, extracts the company name from the first two pages and maps it to the UIN.
+    """
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PDF.")
 
     file_bytes = await file.read()
     text = extract_text_from_pdf(file_bytes)
 
-    # Extract UIN from document
+    # Extract UIN from the full document text
     uin = extract_uin(text)
     if not uin:
         raise HTTPException(status_code=400, detail="No valid UIN found in the document.")
 
-    # Split text into chunks
+    # Check if the UIN already has embeddings in Qdrant
+    existing_embeddings = qdrant.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=[0] * 1536,  # Dummy vector, since we are using a filter only
+        query_filter=Filter(must=[FieldCondition(key="uin", match=MatchValue(value=uin))]),
+        limit=1  # We only need to check if at least one exists
+    )
+
+    if existing_embeddings:
+        valid_uins.add(uin)
+        first_two_pages_text = extract_text_from_first_two_pages(file_bytes)
+        company_prompt = PromptTemplate(input_variables=["page_text"], template=company_prompt_template)
+        formatted_company_prompt = company_prompt.format(page_text=first_two_pages_text)
+        company_result = llm.invoke(formatted_company_prompt)
+        company_name = company_result.content.strip()
+
+        # Map UIN to company name
+        uin_to_company[uin] = company_name
+        return {"uin": uin, "num_chunks": "chunks are already stored"}
+
+    # Extract company name from the first two pages using LLM
+    first_two_pages_text = extract_text_from_first_two_pages(file_bytes)
+    company_prompt = PromptTemplate(input_variables=["page_text"], template=company_prompt_template)
+    formatted_company_prompt = company_prompt.format(page_text=first_two_pages_text)
+    company_result = llm.invoke(formatted_company_prompt)
+    company_name = company_result.content.strip()
+
+    # Map UIN to company name
+    uin_to_company[uin] = company_name
+
+    # Split the full text into chunks
     chunks = text_splitter.split_text(text)
 
     # Convert text chunks to embeddings
@@ -145,11 +177,14 @@ async def pdf_upload(file: UploadFile = File(...)):
 
     valid_uins.add(uin)
 
-    return {"uin": uin, "num_chunks": len(chunks)}
+    return {"uin": uin, "company_name": company_name, "num_chunks": len(chunks)}
+
 
 @app.post("/query")
 async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
-    """Processes a query by searching relevant PDF content and generating a response."""
+    """Processes a query by searching relevant PDF content and generating a response.
+    The final answer will include the company name followed by the answer for each UIN.
+    """
     if not uins:
         raise HTTPException(status_code=400, detail="No UINs provided")
 
@@ -180,7 +215,7 @@ async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
             # Build context from top retrieved chunks
             context = "\n\n".join([hit.payload["text"] for hit in search_results])
 
-            # Create prompt
+            # Create prompt for generating answer
             prompt = PromptTemplate(input_variables=["context", "query"], template=prompt_template)
             formatted_prompt = prompt.format(context=context, query=query)
 
@@ -188,8 +223,12 @@ async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
             answer = llm.invoke(formatted_prompt)
             answers_by_uin[uin] = answer.content
 
-    # Merge answers into a final response
-    final_answer = "\n\n".join([answers_by_uin[uin] for uin in uins])
+    # Merge answers into a final response in the format: "Company Name: answer"
+    final_answer_parts = []
+    for uin in uins:
+        company_name = uin_to_company.get(uin, "Unknown Company")
+        final_answer_parts.append(f"{company_name}: {answers_by_uin[uin]}")
+    final_answer = "\n\n".join(final_answer_parts)
 
     return {
         "final_answer": final_answer,
