@@ -45,10 +45,16 @@ qdrant = QdrantClient(QDRANT_URL)
 COLLECTION_NAME = "insurance_policies"
 
 # Ensure Qdrant collection is created
-qdrant.recreate_collection(
-    collection_name=COLLECTION_NAME,
-    vectors_config=VectorParams(size=1536, distance=Distance.COSINE)  # OpenAI embedding size
-)
+try:
+    # Attempt to retrieve the collection. If it does not exist, an error will be raised.
+    collection_info = qdrant.get_collection(collection_name=COLLECTION_NAME)
+except Exception as e:
+    # If the collection is not found, create it.
+    qdrant.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
+    )
+
 
 # Global sets/dicts to track UINs and company names
 valid_uins = set()
@@ -60,35 +66,6 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap=50,
     separators=["\n\n", "\n", "(?<=\. )", " ", ""]
 )
-
-# Prompt template for generating answers
-prompt_template = """
-You are an insurance policy document analysis expert specializing in extracting, analyzing, and presenting precise insights from insurance policy documents. Your task is to generate an accurate response using only the provided policy content while ensuring clarity, completeness, and structured formatting.
-
-### Guidelines for Response:
-#### 1. Accurate Extraction:
-- Extract only relevant details from the policy document.
-- Ensure responses are precise, complete, and directly based on the context provided.
-- Do NOT provide financial, investment, or legal advice.
-
-#### 2. Structured & Professional Formatting:
-  - Clear, concise, and well-formatted answers:
-  - Use bullet points or numbered lists where applicable.
-  - Present information in an organized and professional manner.
-
-- Use a structured breakdown of key financial figures, highlighting limits, charges, and benefits.
-
----
-
-### Policy Document Context:**
-{context}  
-
-### User's Query:
-{query}  
-
-### Answer:
-
-"""
 
 # Prompt template for extracting company name
 company_prompt_template = """
@@ -182,24 +159,34 @@ async def pdf_upload(file: UploadFile = File(...)):
 
 @app.post("/query")
 async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
-    """Processes a query by searching relevant PDF content and generating a response.
-    The final answer will include the company name followed by the answer for each UIN.
+    """
+    Processes a query by grouping the relevant policy content by company,
+    then passes two vectors (companies and corresponding contexts) to the LLM.
+    The prompt instructs the LLM to think step by step:
+      1. Analyze what the query wants.
+      2. Get the context for each company.
+      3. Provide the answer based on the analysis.
     """
     if not uins:
         raise HTTPException(status_code=400, detail="No UINs provided")
 
-    # Validate UINs
+    # Validate UINs.
     for uin in uins:
         if uin not in valid_uins:
             raise HTTPException(status_code=404, detail=f"UIN {uin} not found")
 
-    # Convert query to embedding
+    # Convert query to an embedding (one time only).
     query_embedding = embeddings.embed_query(query)
 
-    answers_by_uin = {}
+    # Dictionary to hold aggregated context per company.
+    aggregated_context = {}
 
+    # For each UIN, retrieve the relevant text chunks and group them by company.
     for uin in uins:
-        # Filter by UIN before performing similarity search
+        # Get the company name for this UIN.
+        company_name = uin_to_company.get(uin, "Unknown Company")
+
+        # Search Qdrant for the top relevant chunks for this UIN.
         search_results = qdrant.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_embedding,
@@ -209,31 +196,56 @@ async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
             limit=5  # Retrieve top 5 results
         )
 
-        if not search_results:
-            answers_by_uin[uin] = "No relevant information found in the provided document."
-        else:
-            # Build context from top retrieved chunks
+        # Build the context string from the retrieved chunks.
+        if search_results:
             context = "\n\n".join([hit.payload["text"] for hit in search_results])
+        else:
+            context = "No relevant excerpts found."
 
-            # Create prompt for generating answer
-            prompt = PromptTemplate(input_variables=["context", "query"], template=prompt_template)
-            formatted_prompt = prompt.format(context=context, query=query)
+        # Append or initialize the aggregated context for the company.
+        if company_name in aggregated_context:
+            aggregated_context[company_name] += "\n\n" + context
+        else:
+            aggregated_context[company_name] = context
 
-            # Get LLM response
-            answer = llm.invoke(formatted_prompt)
-            answers_by_uin[uin] = answer.content
+    # Build two parallel lists: one for company names and one for their corresponding contexts.
+    companies = list(aggregated_context.keys())
+    contexts = [aggregated_context[company] for company in companies]
 
-    # Merge answers into a final response in the format: "Company Name: answer"
-    final_answer_parts = []
-    for uin in uins:
-        company_name = uin_to_company.get(uin, "Unknown Company")
-        final_answer_parts.append(f"{company_name}: {answers_by_uin[uin]}")
-    final_answer = "\n\n".join(final_answer_parts)
+    # Create a prompt that explains the structure of the data and instructs the LLM to think step by step.
+    # For example:
+    prompt = f"""
+You are an insurance policy document analysis expert.
+Below are two vectors:
+1. A vector of companies: {companies}
+2. A vector of corresponding contexts: {contexts}
+
+For each index i, company[i] is the company name and context[i] is the policy document excerpts associated with that company.
+
+User Query: "{query}"
+
+Please follow these steps:
+1. Analyze the query and explain what information it is asking for (do not include this explanation in your final answer).
+2. For each company, analyze the provided context and extract the relevant details (do not include this intermediate analysis in your final answer).
+3. Based solely on the provided contexts, provide a detailed and structured answer that addresses the query for each company.
+4. Do not provide any financial advice. If the query requests financial advice, simply state that you cannot provide financial advice.
+5. Do not assume any information beyond what is provided in the contexts.
+6. If the answer cannot be determined from the provided context, apologize and state that you are unable to find the requested information.
+7. Do not preface your final answer with phrases such as "here is the final answer" or "based on what I got." Simply provide the answer.
+
+Think step by step and then provide your final answer.
+"""
+
+
+    # Call the LLM once with the complete prompt.
+    answer = llm.invoke(prompt)
 
     return {
-        "final_answer": final_answer,
-        "individual_answers": answers_by_uin
+        "final_answer": answer.content,
+        "companies": companies,           # Optionally return these for debugging.
+        "contexts": contexts              # Optionally return these for debugging.
     }
+
 
 if __name__ == "__main__":
     import uvicorn
