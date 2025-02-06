@@ -2,6 +2,7 @@ import re
 import uuid
 import os
 import io
+import json
 from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
@@ -54,7 +55,6 @@ except Exception as e:
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
     )
-
 
 # Global sets/dicts to track UINs and company names
 valid_uins = set()
@@ -160,12 +160,11 @@ async def pdf_upload(file: UploadFile = File(...)):
 @app.post("/query")
 async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
     """
-    Processes a query by grouping the relevant policy content by company,
-    then passes two vectors (companies and corresponding contexts) to the LLM.
-    The prompt instructs the LLM to think step by step:
-      1. Analyze what the query wants.
-      2. Get the context for each company.
-      3. Provide the answer based on the analysis.
+    Processes a query by decomposing it into three subqueries.
+    For each subquery:
+      1. Retrieve context for each UIN (grouped by company).
+      2. Call the LLM to generate an answer.
+    Finally, merge the three subquery answers into one final answer.
     """
     if not uins:
         raise HTTPException(status_code=400, detail="No UINs provided")
@@ -175,75 +174,120 @@ async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
         if uin not in valid_uins:
             raise HTTPException(status_code=404, detail=f"UIN {uin} not found")
 
-    # Convert query to an embedding (one time only).
-    query_embedding = embeddings.embed_query(query)
+    # === STEP 1: Decompose the query into 3 subqueries ===
+    decomposition_prompt = f"""
+You are an expert in decomposing complex insurance-related queries into three distinct, logically structured subqueries. 
+Your goal is to break down the given query into a step-by-step reasoning process that enhances retrieval quality from a vector database.
 
-    # Dictionary to hold aggregated context per company.
-    aggregated_context = {}
+**Guidelines:**
+- Each subquery should be independent yet logically connected to the original query.
+- Frame them in a way that helps retrieve the most relevant policy details from insurance documents via similarity search.
+- Ensure they progressively refine the understanding of the original question.
+- Output format:
+    Subquery 1: <subquery 1 text>
+    Subquery 2: <subquery 2 text>
+    Subquery 3: <subquery 3 text>
 
-    # For each UIN, retrieve the relevant text chunks and group them by company.
-    for uin in uins:
-        # Get the company name for this UIN.
-        company_name = uin_to_company.get(uin, "Unknown Company")
-
-        # Search Qdrant for the top relevant chunks for this UIN.
-        search_results = qdrant.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_embedding,
-            query_filter=Filter(
-                must=[FieldCondition(key="uin", match=MatchValue(value=uin))]
-            ),
-            limit=5  # Retrieve top 5 results
-        )
-
-        # Build the context string from the retrieved chunks.
-        if search_results:
-            context = "\n\n".join([hit.payload["text"] for hit in search_results])
-        else:
-            context = "No relevant excerpts found."
-
-        # Append or initialize the aggregated context for the company.
-        if company_name in aggregated_context:
-            aggregated_context[company_name] += "\n\n" + context
-        else:
-            aggregated_context[company_name] = context
-
-    # Build two parallel lists: one for company names and one for their corresponding contexts.
-    companies = list(aggregated_context.keys())
-    contexts = [aggregated_context[company] for company in companies]
-
-    # Create a prompt that explains the structure of the data and instructs the LLM to think step by step.
-    # For example:
-    prompt = f"""
-You are an insurance policy document analysis expert.
-Below are two vectors:
-1. A vector of companies: {companies}
-2. A vector of corresponding contexts: {contexts}
-
-For each index i, company[i] is the company name and context[i] is the policy document excerpts associated with that company.
-
-User Query: "{query}"
-
-Please follow these steps:
-1. Analyze the query and explain what information it is asking for (do not include this explanation in your final answer).
-2. For each company, analyze the provided context and extract the relevant details (do not include this intermediate analysis in your final answer).
-3. Based solely on the provided contexts, provide a detailed and structured answer that addresses the query for each company.
-4. Do not provide any financial advice. If the query requests financial advice, simply state that you cannot provide financial advice.
-5. Do not assume any information beyond what is provided in the contexts.
-6. If the answer cannot be determined from the provided context, apologize and state that you are unable to find the requested information.
-7. Do not preface your final answer with phrases such as "here is the final answer" or "based on what I got." Simply provide the answer.
-
-Think step by step and then provide your final answer.
+Original Query: "{query}"
 """
+    decomposition_result = llm.invoke(decomposition_prompt)
+    decomposition_text = decomposition_result.content.strip()
 
+    # Use regex to extract the three subqueries.
+    subqueries = []
+    for i in range(1, 4):
+        pattern = rf"Subquery {i}:\s*(.+)"
+        match = re.search(pattern, decomposition_text)
+        if match:
+            subqueries.append(match.group(1).strip())
+    if len(subqueries) != 3:
+        raise HTTPException(status_code=500, detail="Failed to decompose query into 3 subqueries.")
 
-    # Call the LLM once with the complete prompt.
-    answer = llm.invoke(prompt)
+    print(subqueries)
+    # Dictionary to hold the answer for each subquery.
+    subquery_answers = {}
+
+    # === STEP 2: Process each subquery separately ===
+    for idx, subquery in enumerate(subqueries, start=1):
+        # For each UIN, retrieve relevant text chunks and group them by company.
+        aggregated_context = {}
+        for uin in uins:
+            company_name = uin_to_company.get(uin, "Unknown Company")
+
+            # Retrieve top 5 relevant chunks for the current subquery from Qdrant.
+            subquery_embedding = embeddings.embed_query(subquery)
+            search_results = qdrant.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=subquery_embedding,
+                query_filter=Filter(
+                    must=[FieldCondition(key="uin", match=MatchValue(value=uin))]
+                ),
+                limit=5
+            )
+
+            if search_results:
+                context = "\n\n".join([hit.payload["text"] for hit in search_results])
+            else:
+                context = "No relevant excerpts found."
+
+            if company_name in aggregated_context:
+                aggregated_context[company_name] += "\n\n" + context
+            else:
+                aggregated_context[company_name] = context
+
+        companies = list(aggregated_context.keys())
+        contexts = [aggregated_context[company] for company in companies]
+
+        # Build a prompt for the current subquery.
+        subquery_prompt = f"""
+You are an insurance policy analysis expert tasked with answering specific questions using extracted document excerpts.
+For each index i, companies[i] is the company name and contexts[i] is the policy document excerpts associated with that company.
+
+**Given Information:**
+- **Companies:** {companies}
+- **Corresponding Policy Contexts:** {contexts}
+- **Subquery:** "{subquery}"
+
+**Instructions:**
+1. Carefully analyze the provided policy excerpts for each company.
+2. Extract only the most relevant details needed to answer the subquery.
+3. Provide a structured and well-reasoned response based solely on the given excerpts.
+4. If certain details are missing, explicitly state that the information is not available in the provided context.
+
+**Your Response:**
+"""
+        subquery_result = llm.invoke(subquery_prompt)
+        subquery_answers[f"Subquery {idx}"] = subquery_result.content.strip()
+
+    # === STEP 3: Merge the subquery answers into a final answer ===
+    merge_prompt = f"""
+You are an expert in insurance policy document analysis. Your task is to synthesize multiple structured answers into a single, coherent response.
+
+**Input:**
+- Subquery 1: "{subqueries[0]}" 
+  **Answer:** {subquery_answers['Subquery 1']}
+
+- Subquery 2: "{subqueries[1]}" 
+  **Answer:** {subquery_answers['Subquery 2']}
+
+- Subquery 3: "{subqueries[2]}" 
+  **Answer:** {subquery_answers['Subquery 3']}
+
+**Instructions:**
+1. Combine the subquery responses into a single, well-structured answer.
+2. Ensure logical coherence and avoid redundancy.
+3. Maintain clarity and accuracy, strictly relying on the provided answers.
+4. Do not add speculative information or generic explanations.
+5. Present the final response concisely without introductory or concluding remarks.
+
+**Final Answer:**
+"""
+    final_merge_result = llm.invoke(merge_prompt)
 
     return {
-        "final_answer": answer.content,
-        "companies": companies,           # Optionally return these for debugging.
-        "contexts": contexts              # Optionally return these for debugging.
+        "final_answer": final_merge_result.content.strip(),
+        "subqueries": subqueries,
+        "subquery_answers": subquery_answers
     }
 
 
