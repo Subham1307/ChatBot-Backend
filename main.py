@@ -223,11 +223,21 @@ def query_chain(query: str, uins: List[str]) -> dict:
     # Build aggregated context by retrieving Qdrant results per UIN.
     aggregated_context = build_aggregated_context(uins, query)
     companies = list(aggregated_context.keys())
-    contexts = [aggregated_context[company] for company in companies]
     
-    # Execute the final chain using the collected companies, contexts, and the user query.
+    citations = []
+    for company in companies:
+        chunks = aggregated_context[company].split("\n\n")
+        for chunk in chunks:
+            citations.append({"company": company, "text": chunk, "chunk_id": uuid.uuid4().hex})
+
+    contexts = [c["text"] for c in citations]
+    
     final_answer = final_chain.run(companies=companies, contexts=contexts, query=query)
-    return {"final_answer": final_answer.strip(), "contexts": contexts}
+    
+    return {
+        "final_answer": final_answer.strip(),
+        "citations": citations
+    }
 
 # Wrap the query_chain in a TruCustomApp with the feedback function.
 try:
