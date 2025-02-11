@@ -27,6 +27,12 @@ from trulens.providers.openai import OpenAI as TruOpenAI
 import numpy as np
 from trulens.dashboard import run_dashboard
 
+# ---------------------------
+# Added Imports for Reranking
+# ---------------------------
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+
 # Create a TruSession for evaluation recording and reset it.
 session = TruSession()
 session.reset_database()
@@ -158,6 +164,38 @@ async def pdf_upload(file: UploadFile = File(...)):
 #           Query Chain and TruLens          #
 #############################################
 
+# ---------------------------
+# Reranking Helper Functions
+# ---------------------------
+# Initialize the cross-encoder reranker model and tokenizer
+reranker_tokenizer = AutoTokenizer.from_pretrained('cross-encoder/ms-marco-MiniLM-L-6-v2')
+reranker_model = AutoModelForSequenceClassification.from_pretrained('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+def rerank_results(query: str, search_results: List) -> List:
+    """
+    Rerank search results using a cross-encoder.
+    Each result in search_results is expected to have a payload with a "text" field.
+    """
+    # Create pairs of (query, document text)
+    pairs = [(query, result.payload["text"]) for result in search_results]
+    
+    # Tokenize the pairs
+    inputs = reranker_tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+    
+    # Compute relevance scores (logits)
+    with torch.no_grad():
+        scores = reranker_model(**inputs).logits.squeeze().tolist()
+    
+    # Ensure scores is a list even if there's only one result
+    if not isinstance(scores, list):
+        scores = [scores]
+    
+    # Combine scores with search_results and sort in descending order
+    sorted_results = [
+        result for _, result in sorted(zip(scores, search_results), key=lambda x: x[0], reverse=True)
+    ]
+    return sorted_results
+
 # Helper function to build aggregated context from Qdrant for each UIN.
 def build_aggregated_context(uins: List[str], query: str) -> dict:
     aggregated_context = {}
@@ -168,12 +206,20 @@ def build_aggregated_context(uins: List[str], query: str) -> dict:
             collection_name=COLLECTION_NAME,
             query_vector=query_embedding,
             query_filter=Filter(must=[FieldCondition(key="uin", match=MatchValue(value=uin))]),
-            limit=5
+            limit=20
         )
-        # Debug: Print search results
+        # Debug: Print initial search results
         for idx, hit in enumerate(search_results):
-            print(f"Result {idx + 1} for {company_name}: {hit.payload['text']}")
-        context = "\n\n".join([hit.payload["text"] for hit in search_results]) if search_results else "No relevant excerpts found."
+            print(f"Initial Result {idx + 1} for {company_name}: {hit.payload['text']}")
+        
+        # Rerank the search results based on the query relevance
+        reranked_results = rerank_results(query, search_results)
+        top_results = reranked_results[:5]
+        # Debug: Print reranked results
+        for idx, hit in enumerate(top_results):
+            print(f"Reranked Result {idx + 1} for {company_name}: {hit.payload['text']}")
+        
+        context = "\n\n".join([hit.payload["text"] for hit in top_results]) if top_results else "No relevant excerpts found."
         aggregated_context[company_name] = context
     return aggregated_context
 
@@ -196,12 +242,12 @@ Instructions:
 2. Think for Each Company Separately:
    - For each company[i], analyze its associated policy excerpts in contexts[i].
    - Extract all relevant details specific to that company's policies.
-   - Think of the deatiled answer for that company in your mind
+   - Think of the detailed answer for that company in your mind.
 3. Compile a Final Answer:
    - Summarize the key insights from all the company-specific responses.
    - Ensure the final answer is detailed, comprehensive, and clearly states if any critical information is missing.
-4. Ensure that response should not provide any finacial advice, if user asks for financial advice then clearly state that you are unable to give any advice
-5. If the question if out of your context then you should respond that you dont know the answer
+4. Ensure that response should not provide any finacial advice, if user asks for financial advice then clearly state that you are unable to give any advice.
+5. If the question is out of your context then you should respond that you don't know the answer.
 6. Please provide direct answers without preemptive phrases.
 Final Answer:
 """
