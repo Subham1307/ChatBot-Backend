@@ -18,7 +18,31 @@ from langchain.chains import LLMChain
 
 from utils.uin import extract_uin  # Import UIN extraction function
 
-# Initialize FastAPI app
+# ---------------------------
+# TruLens Imports and Setup
+# ---------------------------
+from trulens.apps.custom import instrument, TruCustomApp
+from trulens.core import TruSession, Feedback, Select
+from trulens.providers.openai import OpenAI as TruOpenAI
+import numpy as np
+from trulens.dashboard import run_dashboard
+
+# Create a TruSession for evaluation recording and reset it.
+session = TruSession()
+session.reset_database()
+
+# Create a TruLens provider instance (using the same LLM engine as our chain)
+provider = TruOpenAI(model_engine="gpt-4o-2024-08-06")
+
+# Define a simple feedback function evaluating answer relevance using inputs and outputs.
+f_answer_relevance = Feedback(
+    provider.relevance_with_cot_reasons,
+    name="Answer Relevance"
+).on_input().on_output()
+
+# ---------------------------
+# FastAPI and Core App Setup
+# ---------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -31,7 +55,7 @@ app.add_middleware(
 # Load environment variables
 load_dotenv()
 
-# Initialize OpenAI LLM and Embeddings
+# Initialize LLM and Embeddings
 llm = ChatOpenAI(model_name="gpt-4o-2024-08-06", temperature=0)
 embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -39,7 +63,7 @@ embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 qdrant = QdrantClient(QDRANT_URL)
 
-# Collection name
+# Collection name for policies
 COLLECTION_NAME = "insurance_policies"
 try:
     # Check if the collection exists
@@ -98,7 +122,7 @@ async def pdf_upload(file: UploadFile = File(...)):
     if not uin:
         raise HTTPException(status_code=400, detail="No valid UIN found in the document.")
     
-    # Check if embeddings for this UIN already exist
+    # Check if embeddings for this UIN already exist using a dummy vector
     existing_embeddings = qdrant.search(
         collection_name=COLLECTION_NAME,
         query_vector=[0] * 1536,  # Dummy vector to use the filter only
@@ -131,10 +155,10 @@ async def pdf_upload(file: UploadFile = File(...)):
     return {"uin": uin, "company_name": company_name, "num_chunks": len(chunks)}
 
 #############################################
-#           Query Chain Conversion          #
+#           Query Chain and TruLens          #
 #############################################
 
-# A helper function that builds the aggregated context by querying Qdrant for each UIN.
+# Helper function to build aggregated context from Qdrant for each UIN.
 def build_aggregated_context(uins: List[str], query: str) -> dict:
     aggregated_context = {}
     for uin in uins:
@@ -146,46 +170,40 @@ def build_aggregated_context(uins: List[str], query: str) -> dict:
             query_filter=Filter(must=[FieldCondition(key="uin", match=MatchValue(value=uin))]),
             limit=5
         )
-
-        # Debugging: Print search results
+        # Debug: Print search results
         for idx, hit in enumerate(search_results):
-            print(f"Result {idx + 1}: {hit.payload['text']}")
-
-        # If no results are found, provide a default message.
+            print(f"Result {idx + 1} for {company_name}: {hit.payload['text']}")
         context = "\n\n".join([hit.payload["text"] for hit in search_results]) if search_results else "No relevant excerpts found."
-
         aggregated_context[company_name] = context
     return aggregated_context
 
-# Define a prompt template that includes companies, their associated contexts, and the user query.
+# Prompt template for the final aggregated query
 final_prompt_template = """
 You are an insurance policy analysis expert tasked with answering a query using extracted document excerpts.
 For each index i, companies[i] is the company name and contexts[i] is the policy document excerpts associated with that company.
 
-**Given Information:**
-- **Companies:** {companies}
-- **Corresponding Policy Contexts:** {contexts}
-- **Query:** "{query}"
+Given Information:
+- Companies: {companies}
+- Corresponding Policy Contexts: {contexts}
+- Query: "{query}"
 
-**Instructions:**
-1. **Analyze the Query and Extract Relevant Information:**
+Instructions:
+1. Analyze the Query and Extract Relevant Information:
    - Thoroughly review the query and the provided contexts.
-   - Ensure that your analysis is concise, user-friendly, and directly addresses the query.
+   - Ensure that your analysis is detailed, accurate, concise, user-friendly, and directly addresses the query.
    - If certain details are missing, explicitly state that the information is not available.
 
-2. **Answer for Each Company Separately:**
+2. Think for Each Company Separately:
    - For each company[i], analyze its associated policy excerpts in contexts[i].
-   - Extract relevant details specific to that company's policies.
-   - Provide a brief, company-specific response.
-
-3. **Compile a Final Answer:**
+   - Extract all relevant details specific to that company's policies.
+   - Think of the deatiled answer for that company in your mind
+3. Compile a Final Answer:
    - Summarize the key insights from all the company-specific responses.
-   - Understand how the user wants the answer (including any specific format, style, or level of detail) and deliver the final answer accordingly.
-   - Ensure the final answer is concise, comprehensive, and clearly states if any critical information is missing from the provided contexts.
-
-**Final Answer:**
-
-
+   - Ensure the final answer is detailed, comprehensive, and clearly states if any critical information is missing.
+4. Ensure that response should not provide any finacial advice, if user asks for financial advice then clearly state that you are unable to give any advice
+5. If the question if out of your context then you should respond that you dont know the answer
+6. Please provide direct answers without preemptive phrases.
+Final Answer:
 """
 
 # Create an LLMChain using the final prompt template.
@@ -194,7 +212,8 @@ final_chain = LLMChain(
     prompt=PromptTemplate(input_variables=["companies", "contexts", "query"], template=final_prompt_template)
 )
 
-# This chain function wraps the retrieval and final LLM call.
+# Instrument the query_chain function using TruLens.
+@instrument
 def query_chain(query: str, uins: List[str]) -> dict:
     # Validate UINs.
     for uin in uins:
@@ -210,11 +229,27 @@ def query_chain(query: str, uins: List[str]) -> dict:
     final_answer = final_chain.run(companies=companies, contexts=contexts, query=query)
     return {"final_answer": final_answer.strip(), "contexts": contexts}
 
+# Wrap the query_chain in a TruCustomApp with the feedback function.
+try:
+    tru_query_app = TruCustomApp(
+        query_chain,
+        app_name="QueryChain",
+        app_version="1.0",
+        feedbacks=[f_answer_relevance]
+    )
+    print("TruCustomApp initialized successfully.")
+except Exception as e:
+    print("Error initializing TruCustomApp:", e)
+
 # Expose the query chain via an endpoint.
 @app.post("/query")
 async def query_endpoint(query: str = Body(...), uins: List[str] = Body(...)):
-    result = query_chain(query, uins)
+    # Execute the instrumented query_chain within the TruCustomApp context.
+    with tru_query_app as recording:
+         result = query_chain(query, uins)
     return result
+
+run_dashboard(session)
 
 if __name__ == "__main__":
     import uvicorn
